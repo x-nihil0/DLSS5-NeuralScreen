@@ -20,6 +20,7 @@ Two rules the hard way:
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import os
 import struct
 import subprocess
@@ -120,6 +121,121 @@ def _drain_stderr(worker, logs: list[str], stop: threading.Event) -> None:
         pass
 
 
+# --- A Job Object so a dead parent cannot orphan a worker ----------------
+# The worker owns a D3D12 swap-chain window and presents to the screen on its
+# own. If Python dies WITHOUT running shutdown_worker - a force-kill, an
+# unhandled crash, the GPU-access-loss cascade that ends a session with
+# exit 0x40010004 - stdin never closes cleanly and the worker keeps
+# presenting. On an HDR session it is presenting HDR10 PQ, so the leftover
+# window sits over the desktop as a washed-out layer that survives every app
+# restart and clears only on reboot. The tell is Windows' own "waiting for
+# nvngx.dll to close" at shutdown: a process nothing owns any more, reported
+# by a user who saw exactly that dialog (20.09).
+#
+# A Job Object with KILL_ON_JOB_CLOSE closes the hole at the OS level. The
+# handle lives for the life of THIS process and is never closed by us; when
+# Python exits for ANY reason the OS closes it and the kernel terminates
+# every worker still in the job. Graceful shutdown is unchanged and remains
+# the normal path - this is the net under it, and it also covers the
+# converter's transient workers, which take the same start_worker road.
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateJobObjectW.restype = wintypes.HANDLE
+_k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+_k32.SetInformationJobObject.restype = wintypes.BOOL
+_k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                         wintypes.LPVOID, wintypes.DWORD]
+_k32.AssignProcessToJobObject.restype = wintypes.BOOL
+_k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JobObjectExtendedLimitInformation = 9
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+#: The job every worker is bound to. None means the platform refused it and
+#: the program runs exactly as before - best-effort, never fatal.
+_WORKER_JOB = None
+_WORKER_JOB_TRIED = False
+
+
+def _ensure_worker_job():
+    """Create the kill-on-close job once; return its handle or None."""
+    global _WORKER_JOB, _WORKER_JOB_TRIED
+    if _WORKER_JOB_TRIED:
+        return _WORKER_JOB
+    _WORKER_JOB_TRIED = True
+    try:
+        job = _k32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _k32.SetInformationJobObject(
+                job, _JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            err = ctypes.get_last_error()
+            _k32.CloseHandle(job)
+            raise ctypes.WinError(err)
+        _WORKER_JOB = job
+        print("[main] worker job object armed (KILL_ON_JOB_CLOSE) - a crashed "
+              "NeuralScreen cannot leave the worker running")
+    except Exception as exc:
+        print(f"[main] worker job object unavailable ({exc}) - a hard crash "
+              f"could leave the worker running until reboot", file=sys.stderr)
+        _WORKER_JOB = None
+    return _WORKER_JOB
+
+
+def bind_worker_to_job(worker: subprocess.Popen) -> bool:
+    """Put a freshly spawned worker into the kill-on-close job. Best-effort."""
+    job = _ensure_worker_job()
+    if job is None:
+        return False
+    try:
+        if not _k32.AssignProcessToJobObject(job, int(worker._handle)):
+            err = ctypes.get_last_error()
+            # ERROR_ACCESS_DENIED (5) usually means the parent is itself in a
+            # job that forbids nesting - rare on Win8+. The graceful path
+            # still runs on a normal exit; only a hard crash stays exposed.
+            print(f"[main] worker not bound to the job (err {err}); graceful "
+                  f"shutdown still applies", file=sys.stderr)
+            return False
+        return True
+    except Exception as exc:
+        print(f"[main] worker job bind failed ({exc})", file=sys.stderr)
+        return False
+
+
 def start_worker(params: dict, width: int, height: int, warmup: int,
                  full_w: int = 0, full_h: int = 0,
                  shm: "SharedFrameBuffer | None" = None) -> tuple[
@@ -148,6 +264,9 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
         stderr=subprocess.PIPE,
         creationflags=creation_flags,
     )
+    # Bound before it has run long enough to open a window or a swap chain,
+    # so nothing it creates can outlive a parent that dies right after.
+    bind_worker_to_job(worker)
     logs: list[str] = []
     stop = threading.Event()
     try:
@@ -574,7 +693,8 @@ def switch_monitor(st, new_monitor: int | str) -> None:
         st.cfg["monitor"] = st.monitor
         st.display.alert(UI_STRINGS[st.lang]["mon_fail"])
     st.width, st.height = st.capture.resolution
-    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
+    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale,
+                                       getattr(st, 'nr_passes', 1))
     # The worker reads NS_OUTPUT / NS_WINDOW_POS at every OpenDda/OpenPresent,
     # and the overlay is rebuilt below - so the new monitor's identity goes
     # out before the rebuild (issues #28, #33).
@@ -659,7 +779,8 @@ def switch_window(st, hwnd: int) -> None:
         st.window_hwnd = None
         st.width, st.height = st.capture.resolution
         note = UI_STRINGS[st.lang]["win_mode_off"]
-    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
+    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale,
+                                       getattr(st, 'nr_passes', 1))
     st.follow_pos = None        # a fresh overlay starts at (0,0)
     st.follow_resize = None
     # The window size this pipeline was built for, as WE measure it. It is
@@ -731,7 +852,8 @@ def resize_window_live(st, frame_w: int, frame_h: int) -> bool:
         return False
     if aw < 64 or ah < 64:
         return False
-    new_w, new_h = _work_size(int(aw), int(ah), st.work_scale)
+    new_w, new_h = _work_size(int(aw), int(ah), st.work_scale,
+                              getattr(st, 'nr_passes', 1))
     new_full_w = int(aw) if (new_w != aw or new_h != ah) else 0
     new_full_h = int(ah) if (new_w != aw or new_h != ah) else 0
     try:
@@ -874,7 +996,8 @@ def follow_monitor(st) -> None:
         st.monitor = st.capture.monitor_idx
     st.width, st.height = st.capture.resolution
     st.mon_w, st.mon_h = st.width, st.height
-    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
+    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale,
+                                       getattr(st, 'nr_passes', 1))
     rebuild_pipeline(st, f"{st.width}x{st.height}")
 
 
@@ -1144,7 +1267,8 @@ def do_restart(st, new_scale: float, new_profile: str, new_params: dict,
         # live one is told through the resize below.
         os.environ["NS_NR_SMALL"] = "1" if st.nr_small else "0"
         settings_io.save_menu_layout(st)
-    new_w, new_h = _work_size(st.width, st.height, st.work_scale)
+    new_w, new_h = _work_size(st.width, st.height, st.work_scale,
+                                       getattr(st, 'nr_passes', 1))
     new_full_w = st.width if (new_w != st.width or new_h != st.height) else 0
     new_full_h = st.height if (new_w != st.width or new_h != st.height) else 0
     print(f"[main] applying: profile {new_profile!r}, "

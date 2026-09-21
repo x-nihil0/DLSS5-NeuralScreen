@@ -40,6 +40,7 @@
   "menu_scale_auto": true,
   "fps_overlay": "off",
   "nr_passes": 1,
+  "residual_strength": null,
   "tray_on_minimise": false,
   "tray_on_close": false,
   "menu_height": null,

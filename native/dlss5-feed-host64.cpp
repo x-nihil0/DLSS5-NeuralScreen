@@ -5624,6 +5624,37 @@ static bool EvaluateVideo(VideoState &v, int reset, UINT64 *submitted = nullptr)
     // That is deliberate: "eval on GPU" should mean what the network cost
     // this frame, and with a cascade that is the whole cascade.
     unsigned passes = (v.nr_small && v.nr_alt != nullptr) ? v.passes_live : 1u;
+    // Say so when the cascade is asked for and cannot run. That gate is
+    // silent by construction, and it is the reason a report of "multipass
+    // does nothing" could not be answered from a log: at 1:1 the network
+    // writes the full-res output directly, so there is no work-resolution
+    // scratch to ping-pong through and the count simply becomes one. The
+    // panel meanwhile keeps showing the number the user picked, because it
+    // is drawn under Boost and Boost IS on. Measured while chasing it: at
+    // 960x540 1:1 the output of one pass and of four is byte-identical, and
+    // the features for the other three are built and then discarded - 248 to
+    // 853 MB of video memory, about 200 MB a pass, for nothing.
+    //
+    // Said once per change rather than once per frame, like the shortfall
+    // below: this sits on the frame path.
+    if (v.passes_live > 1u && passes == 1u)
+    {
+        static unsigned reported_inactive = 0u;
+        static int reported_reason = -1;
+        const int reason = v.nr_small ? 1 : 0;
+        if (v.passes_live != reported_inactive || reason != reported_reason)
+        {
+            reported_inactive = v.passes_live;
+            reported_reason = reason;
+            Log("[video] NR cascade inactive: %u pass(es) asked for, 1 running - %s",
+                v.passes_live,
+                v.nr_small
+                    ? "the second work buffer was never created"
+                    : "the network runs at 1:1, which has no work-resolution "
+                      "scratch to cascade through - lower the processing "
+                      "resolution so the residual composite engages");
+        }
+    }
     if (passes < 1u) passes = 1u;
     if (passes > NR_MAX_PASSES) passes = NR_MAX_PASSES;
     // The count is settled BEFORE the first pass writes anything, because the

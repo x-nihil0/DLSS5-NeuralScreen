@@ -126,6 +126,80 @@ def ask_save_path(parent_hwnd: int, default_name: str,
         return fallback_dir / f"neuralscreen-{stamp}{suffix}"
 
 
+def media_filter() -> str:
+    """The Win32 filter for the convert picker, as its own value.
+
+    A function rather than a literal inside the struct builder because this
+    is the part worth testing and the struct is not: `ofn.lpstrFilter` reads
+    back through ctypes as a plain str truncated at the first NUL, so a test
+    that asked the STRUCT what it offers could only ever see the heading.
+
+    The shape is Win32's: label, NUL, pattern, NUL, ... terminated by two.
+    The patterns come from media_convert, so the picker cannot offer a file
+    the converter would then refuse.
+    """
+    from media_convert import IMAGE_SUFFIXES, VIDEO_SUFFIXES
+    nul = chr(0)
+    images = ";".join(f"*{x}" for x in IMAGE_SUFFIXES)
+    videos = ";".join(f"*{x}" for x in VIDEO_SUFFIXES)
+    return (f"Images and video{nul}{images};{videos}{nul}"
+            f"Images{nul}{images}{nul}"
+            f"Video{nul}{videos}{nul}"
+            f"All files (*.*){nul}*.*{nul}")
+
+
+def _open_dialog_struct(parent_hwnd: int, initial_dir: str | None,
+                        title: str | None = None):
+    """The OPENFILENAME for "Open", and the buffer the path comes back in.
+
+    Split from the call for the same reason as the save one: a modal dialog
+    cannot be driven from a test, but the struct it is handed can be, and
+    the struct is where the bug was last time - `lpstrFile = buf` raises
+    inside ctypes unless the array is cast to the pointer type, and the
+    wrapper's own except would have swallowed it.
+
+    The filter lists the formats media_convert will actually open, so the
+    picker cannot offer a file the converter then refuses.
+    """
+    buf = ctypes.create_unicode_buffer(1024)
+    ofn = _OPENFILENAME()
+    ofn.lStructSize = ctypes.sizeof(_OPENFILENAME)
+    ofn.hwndOwner = parent_hwnd or None
+    # The separator is chr(0), not a "\0" escape: this filter is built
+    # by a patch step and a literal NUL in the source file is a
+    # SyntaxError that only shows up at import time.
+    ofn.lpstrFilter = media_filter()
+    ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+    ofn.nMaxFile = 1024
+    ofn.nFilterIndex = 1
+    ofn.lpstrInitialDir = initial_dir or None
+    ofn.lpstrTitle = title or None
+    # OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR. The last one
+    # matters here and not in the save dialog: the worker is started with
+    # cwd=native/, and a dialog that quietly changes the process directory
+    # would break the next worker launch rather than this conversion.
+    ofn.Flags = 0x00001000 | 0x00000800 | 0x00000008
+    return ofn, buf
+
+
+def ask_open_path(parent_hwnd: int, initial_dir: str | None = None,
+                  title: str | None = None) -> Path | None:
+    """The native "Open" dialog. The chosen file, or None on cancel.
+
+    Unlike the save dialog there is no fallback: a conversion with no input
+    is not a conversion, so a dialog that cannot be shown is a cancel.
+    """
+    try:
+        ofn, buf = _open_dialog_struct(parent_hwnd, initial_dir, title)
+        if not ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+            return None
+        chosen = buf.value.strip()
+        return Path(chosen) if chosen else None
+    except Exception as exc:
+        print(f"[dialogs] open dialog unavailable ({exc})", file=sys.stderr)
+        return None
+
+
 def pick_directory(parent_hwnd: int, title: str) -> Path | None:
     """The classic folder picker. The chosen folder, or None on cancel.
 

@@ -559,7 +559,7 @@ _SETTINGS_KEYS = (
     # counter was, or how big the panel had been made. The section exists to
     # answer "how was the program configured" and had quietly stopped
     # answering it for anything new (found in a reporter's package, #96).
-    "nr_direct", "nr_passes", "fps_overlay",
+    "nr_direct", "nr_passes", "residual_strength", "fps_overlay",
     "tray_on_minimise", "tray_on_close",
     "menu_scale", "menu_scale_auto",
     # The four switches that decide WHICH pipeline ran. Without them a report

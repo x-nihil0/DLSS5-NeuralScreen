@@ -311,6 +311,8 @@ class _Pipeline:
         "next_auto_revive",
         "nr_direct",
         "nr_passes",
+        "convert_busy",
+        "convert_status",
         # Which worker has been told the pass count: the cascade has to be
         # re-sent to every new one (see the main loop).
         "nr_passes_pid",

@@ -191,6 +191,46 @@ def _apply_monitor_env(capture) -> tuple[int, int]:
     return _apply_monitor_name(name)
 
 
+def _apply_residual_env(cfg: dict) -> None:
+    """Hand the residual strength to the worker, if the user set one.
+
+    The composite is `native + (nr_out - nr_in) * strength`, and with N
+    passes the delta is roughly N times larger while strength stays where it
+    is. Dividing it by the pass count holds tone, colour and motion where a
+    single pass leaves them - measured, and the numbers are worth keeping:
+
+        passes  strength   d-luma   d-sat   detail   mc-error
+             1      1.00    -2.38  -10.62    0.92x     0.6641
+             4      1.00    -8.88  -28.77    0.75x     1.5294
+             4      0.25    -2.23   -7.53    0.93x     0.3781
+
+    But holding the picture where one pass leaves it is NOT what somebody
+    asking for four passes wants. They want more, and an automatic 1/passes
+    gives them less: it made a two-pass cascade apply half the effect of one
+    pass, which reads as the cascade doing nothing (user, 20.09). Stability
+    is a real property and so is strength, and which one you want is a
+    preference, not a correctness question - so this is a SETTING, empty by
+    default, and the worker's own 1.0 stands unless it is set.
+
+    `residual_strength` in config.json, or NS_NR_RESIDUAL_STRENGTH in the
+    environment. Read once per worker process (from its own environment
+    block, fixed at spawn), so a change to it needs a restart - which is why
+    the pass count does NOT travel this way: that has to stay instant.
+    """
+    if os.environ.get("NS_NR_RESIDUAL_STRENGTH"):
+        return  # a deliberate override, left alone
+    value = cfg.get("residual_strength")
+    if value is None:
+        return  # the worker's own 1.0: more passes, more effect
+    try:
+        strength = min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        print(f"[main] config.json: residual_strength {value!r} is not a "
+              f"number - the worker's default stands", file=sys.stderr)
+        return
+    os.environ["NS_NR_RESIDUAL_STRENGTH"] = f"{strength:.4f}"
+
+
 def _apply_gpu_env(cfg: dict) -> None:
     """Which card the worker runs on, through the environment.
 
@@ -394,9 +434,15 @@ def configure(st) -> None:
     st.nr_passes = int(st.cfg.get("nr_passes", 1))
     #: Frames in a row the worker answered without an NGX evaluation.
     st.nr_idle_streak = 0
+    #: A file conversion is running on its own worker. The loop
+    #: only reads it; commands owns both fields.
+    st.convert_busy = False
+    st.convert_status = ""
     #: The verdict the interface reads: NR is on, but nothing is processed.
     st.nr_not_evaluating = False
     os.environ["NS_NR_RESIDUAL"] = "0" if st.nr_direct else "1"
+    # The composite is normalised by the pass count - see the helper.
+    _apply_residual_env(st.cfg)
     # The Spout2 bridge is the same story: the worker reads NS_SPOUT once
     # at startup (SpoutBridgeInit), so the config flag becomes the
     # environment before the first worker is launched. Off by default -
@@ -478,7 +524,8 @@ def bring_up(st) -> None:
     """
     # The worker and guides run at the work resolution (the NGX feature is
     # created from the header sizes; guides' assert requires them to match)
-    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
+    st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale,
+                                      getattr(st, 'nr_passes', 1))
     # The v3 protocol (full_w/full_h) ONLY when work != full: at work==full
     # (scale 1.0) the worker crashes or hangs in upscale mode (verified in
     # isolation) - we use legacy full_w=0, as in D5V2.

@@ -330,6 +330,8 @@ class OverlayMenu:
             "param_ranges": {},
             # The NR cascade: how many passes run over one frame (experiment).
             "nr_passes": 1,
+            "convert_busy": False,
+            "convert_status": "",
             # version / windows / driver / gpu, from the log header.
             "about": {},
             "compatibility_status": "not_run",
@@ -1476,6 +1478,33 @@ class OverlayMenu:
                                       extra={"label": info_label,
                                              "value": value}))
                     cy += self._u(LABEL_H) + self._u(4)
+
+            # File conversion. It belongs on this tab because this tab is
+            # about the ways a picture leaves the program: recording is the
+            # screen over time, this is a file on disk. The settings are not
+            # repeated here on purpose - a conversion uses the profile and
+            # the sliders the panel is already showing, so there is one place
+            # to tune the look and not two that can disagree.
+            section(s.get("sec_convert", "file conversion"), "rec")
+            busy = bool(self.state.get("convert_busy"))
+            if show:
+                items.append(Item("button", "convert_pick",
+                                  pygame.Rect(pad, cy, inner_w, ctrl_h),
+                                  extra={"label": s.get(
+                                      "convert_pick", "Convert a file..."),
+                                         "filled": False}))
+                cy += ctrl_h + gap
+                # One row that says either what is happening or what the
+                # button is for, so the section is never silent.
+                status = str(self.state.get("convert_status") or "")
+                items.append(Item("info", "convert_status",
+                                  pygame.Rect(pad, cy, inner_w,
+                                              self._u(LABEL_H)),
+                                  extra={"label": s.get(
+                                      "record_state", "State") if busy else "",
+                                         "value": status or s.get(
+                                             "convert_hint", "")}))
+                cy += self._u(LABEL_H) + self._u(4)
 
             section(s["sec_behaviour"], "app")
             # The static-frame skip is OFF and its switch is not drawn. The

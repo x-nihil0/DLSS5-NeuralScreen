@@ -214,11 +214,32 @@ def drain_save_dialog(st) -> None:
             st.shot_dialog_open = False
             if (isinstance(answer, tuple) and len(answer) == 2
                     and answer[0] in (
-                        "save", "screenshot_dir", "recording_dir", "diagnostics")):
+                        "save", "screenshot_dir", "recording_dir", "diagnostics",
+                        "convert_pick", "convert_done")):
                 kind, shot_path = answer
             else:
                 # Backward compatibility for tests and older producers.
                 kind, shot_path = "save", answer
+            if kind == "convert_pick":
+                # The picker answered. Nothing was started yet: the
+                # conversion begins here, on the main thread, so the state
+                # the worker thread copies is read in one place.
+                if shot_path is not None:
+                    begin_conversion(st, Path(shot_path))
+                continue
+            if kind == "convert_done":
+                ok, detail = shot_path
+                st.convert_busy = False
+                st.convert_status = ""
+                if ok:
+                    st.display.alert(UI_STRINGS[st.lang].get(
+                        "convert_done", "Converted: {path}").format(path=detail),
+                        duration=8.0)
+                else:
+                    st.display.alert(UI_STRINGS[st.lang].get(
+                        "convert_failed", "Conversion failed: {details}").format(
+                            details=detail), duration=8.0)
+                continue
             if kind == "diagnostics":
                 ok, detail = shot_path
                 if ok:
@@ -362,6 +383,77 @@ def open_folder_picker(st, kind: str) -> None:
         st.shot_paths.put((kind, selected))
 
     threading.Thread(target=_pick_dir, name="folder-picker", daemon=True).start()
+
+
+def convert_media(st) -> None:
+    """Pick a file and run it through the network, off the UI thread.
+
+    The conversion starts its OWN worker and leaves the overlay's alone.
+    That is allowed: two NGX features on one card at the same time was the
+    open question, and it was measured rather than assumed - a second worker
+    created and evaluated in 1.17 s while the first kept answering, and the
+    first kept answering after the second exited. So this is the diagnostic
+    bundle's shape (a thread and a queue) and not a pipeline teardown, and
+    the picture on screen never stops.
+
+    The settings are the live ones - st.params, st.work_scale, st.nr_small -
+    so the converted file is the picture the panel is showing.
+    """
+    if getattr(st, "convert_busy", False):
+        st.display.alert(UI_STRINGS[st.lang].get(
+            "convert_busy", "A conversion is already running"))
+        return
+    if st.shot_dialog_open:
+        return
+    st.shot_dialog_open = True
+    # pygame is not thread-safe: the handle is read here, on the main thread.
+    hwnd = st.display.get_hwnd()
+    start_dir = _configured_directory(
+        st.cfg.get("recording_dir"), BASE_DIR / "recordings")
+
+    def _pick() -> None:
+        try:
+            chosen = dialogs.ask_open_path(
+                hwnd, str(start_dir),
+                UI_STRINGS[st.lang].get("convert_pick", "Convert a file..."))
+        except Exception as exc:
+            print(f"[main] the convert picker crashed: {exc}", file=sys.stderr)
+            chosen = None
+        st.shot_paths.put(("convert_pick", chosen))
+
+    threading.Thread(target=_pick, name="convert-picker", daemon=True).start()
+
+
+def begin_conversion(st, source) -> None:
+    """Start the conversion itself, once a file has been chosen."""
+    import media_convert
+
+    st.convert_busy = True
+    st.convert_status = UI_STRINGS[st.lang].get(
+        "convert_working", "Converting {name}...").format(name=source.name)
+    st.display.alert(st.convert_status, duration=6.0)
+    params = dict(st.params)
+    work_scale = float(st.work_scale)
+    nr_small = bool(st.nr_small)
+    flow_preset = str(st.cfg.get("flow_preset", "fast"))
+    nr_passes = int(getattr(st, "nr_passes", 1) or 1)
+    out_dir = st.cfg.get("recording_dir") or None
+
+    def _run() -> None:
+        try:
+            result = media_convert.convert(
+                source, None, params, work_scale=work_scale,
+                nr_small=nr_small, nr_passes=nr_passes,
+                flow_preset=flow_preset, out_dir=out_dir)
+            print(f"[main] converted {source.name} -> {result.output} "
+                  f"({result.frames} frame(s), {result.seconds:.1f}s)")
+            answer = (True, str(result.output))
+        except Exception as exc:
+            print(f"[main] conversion failed: {exc}", file=sys.stderr)
+            answer = (False, f"{type(exc).__name__}: {exc}")
+        st.shot_paths.put(("convert_done", answer))
+
+    threading.Thread(target=_run, name="media-convert", daemon=True).start()
 
 
 def create_diagnostics(st) -> None:
@@ -624,9 +716,11 @@ def apply_menu_action(st, action: tuple) -> None:
         st.nr_passes = passes
         st.cfg["nr_passes"] = passes
         print(f"[main] NR cascade -> {passes} pass(es)")
-        # The count travels with the parameters, so the ordinary apply carries
-        # it - no teardown, no warm-up, no frozen picture. request_apply is
-        # the one way to ask; pending_apply is a tuple it builds, not a flag.
+        # The count travels with the parameters, so the ordinary apply
+        # carries it - no teardown, no warm-up, no frozen picture. It went
+        # through a full restart briefly, to re-read a residual strength
+        # derived from the count; that strength is a setting now and the
+        # seconds it cost were not worth it (user, 20.09).
         pipeline.request_apply(st, st.work_scale, st.cfg["profile"], st.params)
     elif kind == "fps_overlay":
         corner = str(action[1])
@@ -767,6 +861,8 @@ def apply_menu_action(st, action: tuple) -> None:
             open_folder_picker(st, "screenshot_dir")
         elif name == "record_dir":
             open_folder_picker(st, "recording_dir")
+        elif name == "convert_pick":
+            convert_media(st)
         elif name == "diagnostics":
             create_diagnostics(st)
         elif name == "github":
@@ -1118,7 +1214,8 @@ def drain_commands(st) -> bool:
                 if abs(new_scale - cur) > 1e-6:
                     want_small = new_scale <= cap + 1e-6
                     applied = new_scale if want_small else st.work_scale
-                    new_w, new_h = _work_size(st.width, st.height, applied)
+                    new_w, new_h = _work_size(st.width, st.height, applied,
+                                              getattr(st, 'nr_passes', 1))
                     print(f"[main] work_scale -> {new_scale:.2f} ({new_w}x{new_h}), "
                           f"boost {'on' if want_small else 'off'}")
                     # Off the ladder's top step the numbers the user is shown

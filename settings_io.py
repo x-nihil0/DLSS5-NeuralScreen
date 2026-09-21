@@ -31,7 +31,8 @@ from winapi import list_capturable_windows, window_frame_rect
 from resolution_limits import safe_processing_size
 
 
-def _work_size(width: int, height: int, scale: float) -> tuple[int, int]:
+def _work_size(width: int, height: int, scale: float,
+               nr_passes: int = 1) -> tuple[int, int]:
     """The NGX work resolution: scale of full, but no larger than
     WORK_MAX_W/H (NGX goes silent at 4K - the limit verified in isolation).
 
@@ -51,11 +52,47 @@ def _work_size(width: int, height: int, scale: float) -> tuple[int, int]:
     else:
         w = max(64, int(width * scale) // 2 * 2)
         h = max(64, int(height * scale) // 2 * 2)
-    w, h = safe_processing_size(int(width), int(height), min(w, int(width)), min(h, int(height)))
+    w, h = safe_processing_size(int(width), int(height),
+                                min(w, int(width)), min(h, int(height)))
     if w > WORK_MAX_W or h > WORK_MAX_H:
         k = min(WORK_MAX_W / w, WORK_MAX_H / h)
         w = max(64, int(w * k) // 2 * 2)
         h = max(64, int(h * k) // 2 * 2)
+    # The cascade needs a work size that DIFFERS from the frame. Its passes
+    # ping-pong between two work-resolution scratch buffers and land in the
+    # one the residual composite reads, and none of that exists at 1:1: the
+    # network writes the full-res output directly there, so the worker forces
+    # the count back to one (`v.nr_small = v.upscale && asked`, and then
+    # `passes = (v.nr_small && v.nr_alt) ? v.passes_live : 1`). It says
+    # nothing while it does it - there is no log line on that path - so a
+    # panel showing four passes was driving one, and the features for the
+    # other three were built and then discarded: measured 248 -> 853 MB of
+    # video memory at 960x540, ~200 MB per pass, for nothing.
+    #
+    # So a pass count above one steps the work size down by the smallest even
+    # amount that engages the residual path. This costs nothing and gains:
+    # the composite keeps the NATIVE frame as the anchor and only adds what
+    # the network changed, where 1:1 shows the network's own output wholesale.
+    # Measured at 960x540 against the untouched source - detail as a share of
+    # the source Laplacian variance:
+    #
+    #     work      passes  cascade   detail
+    #     1:1            1   silent    0.77x
+    #     1:1            4   silent    0.77x   (byte-identical to one pass)
+    #     native-2       4      ran    0.88x
+    #     0.85           4      ran    0.91x
+    #
+    # 1:1 is the WORST of them for detail, which is the opposite of what
+    # "native" sounds like it should mean.
+    if int(nr_passes or 1) > 1 and (w, h) == (int(width), int(height)):
+        w = max(64, (int(width) - 2) // 2 * 2)
+        h = max(64, (int(height) - 2) // 2 * 2)
+        w, h = safe_processing_size(int(width), int(height), w, h)
+        if (w, h) == (int(width), int(height)):
+            # A frame too small to step down from - the floor in
+            # resolution_limits won. Nothing more to do: the cascade cannot
+            # run here and the worker will say so by running one pass.
+            pass
     return min(w, int(width)), min(h, int(height))
 
 
@@ -1242,6 +1279,8 @@ def menu_payload(st) -> dict:
         "rec_indicator": bool(st.cfg.get("rec_indicator", True)),
         "fps_overlay": str(st.cfg.get("fps_overlay", "off")),
         "nr_passes": int(st.cfg.get("nr_passes", 1)),
+        "convert_busy": bool(getattr(st, "convert_busy", False)),
+        "convert_status": str(getattr(st, "convert_status", "")),
         "tray_on_minimise": bool(st.cfg.get("tray_on_minimise", False)),
         "tray_on_close": bool(st.cfg.get("tray_on_close", False)),
         "recording_dir": st.cfg.get("recording_dir") or "",
